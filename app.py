@@ -5,12 +5,21 @@ import random
 import time
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from urllib.parse import urlparse
+import tempfile
+import zipfile
 
 CONFIG_FILE = "config.ini"
 
 def validate_proxy(proxy, test_url='https://api.ipify.org?format=json', timeout=6):
-    proxies = {'http': proxy, 'https': proxy}
     try:
+        parsed = urlparse(proxy)
+        scheme = parsed.scheme.lower()
+        if parsed.username and parsed.password:
+            proxy_url = f"{scheme}://{parsed.username}:{parsed.password}@{parsed.hostname}:{parsed.port}"
+        else:
+            proxy_url = proxy
+        proxies = {'http': proxy_url, 'https': proxy_url}
         response = requests.get(test_url, proxies=proxies, timeout=timeout)
         if response.status_code == 200:
             print(f"[VALID] Proxy {proxy} is working.")
@@ -21,82 +30,184 @@ def validate_proxy(proxy, test_url='https://api.ipify.org?format=json', timeout=
     return False
 
 class ProxyManager:
-    def __init__(self, proxy_file, max_valid_proxies, rotate_per_request=True, test_url='https://api.ipify.org?format=json'):
+    def __init__(self, proxy_file, max_valid_proxies, rotate_per_request=True, test_url='https://api.ipify.org?format=json', chrome_path=None):
         self.proxy_file = proxy_file
         self.rotate_per_request = rotate_per_request
         self.test_url = test_url
+        self.chrome_path = chrome_path
         self.proxies = self._load_and_clean_proxies(proxy_file, max_valid_proxies)
         self.current_proxy = None
+        self.proxy_index = 0
         if not self.proxies:
-            raise RuntimeError("No valid proxies loaded.")
+            raise RuntimeError("No valid or untested proxies loaded.")
 
-    def _load_and_clean_proxies(self, file_path, limit):
-        valid = []
-        all_proxies = []
-        print(f"Loading proxies from '{file_path}' and validating up to {limit} valid proxies...")
+    def _load_and_clean_proxies(self, file_path, max_valid):
+        proxies_status = {}
+
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
-                all_proxies = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+                lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         except FileNotFoundError:
             print(f"[ERROR] Proxy file not found: {file_path}")
             return []
 
-        for proxy in all_proxies:
-            if len(valid) >= limit:
-                break
-            if validate_proxy(proxy, self.test_url):
-                valid.append(proxy)
+        for proxy in lines:
+            proxies_status[proxy] = "untested"
 
-        # Overwrite file with only valid proxies:
+        valid_proxies = []
+
+        print(f"Loading proxies from '{file_path}' and validating untested proxies...")
+
+        for proxy, status in proxies_status.items():
+            if status == "untested":
+                if validate_proxy(proxy, self.test_url):
+                    proxies_status[proxy] = "valid"
+                    valid_proxies.append(proxy)
+                else:
+                    proxies_status[proxy] = "invalid"
+            elif status == "valid":
+                valid_proxies.append(proxy)
+
+            if len(valid_proxies) >= max_valid:
+                break
+
+        proxies_to_keep = [p for p, s in proxies_status.items() if s == "valid" or s == "untested"]
+
         with open(file_path, 'w', encoding='utf-8') as f:
-            for p in valid:
+            for p in proxies_to_keep:
                 f.write(p + '\n')
 
-        print(f"✅ Loaded and saved {len(valid)} valid proxies.")
-        return valid
+        print(f"✅ After cleanup, saved {len(proxies_to_keep)} proxies (valid + untested).")
+        return proxies_to_keep
 
     def get_next_proxy(self):
-        if self.rotate_per_request or not self.current_proxy:
-            self.current_proxy = random.choice(self.proxies)
-        return self.current_proxy
+        if self.rotate_per_request:
+            proxy = self.proxies[self.proxy_index % len(self.proxies)]
+            self.proxy_index += 1
+            return proxy
+        else:
+            return self.proxies[0]
 
     def get_requests_proxy_dict(self):
         proxy = self.get_next_proxy()
-        return {'http': proxy, 'https': proxy}
+        return self.format_proxy_dict(proxy), proxy
 
-    def launch_browser_with_proxy(self):
-        proxy = self.get_next_proxy()
+    def format_proxy_dict(self, proxy):
+        parsed = urlparse(proxy)
+        if parsed.username and parsed.password:
+            auth_part = f"{parsed.username}:{parsed.password}@"
+            host_port = f"{parsed.hostname}:{parsed.port}"
+            proxy_auth_url = f"http://{auth_part}{host_port}"
+            return {'http': proxy_auth_url, 'https': proxy_auth_url}
+        else:
+            if parsed.scheme:
+                proxy_url = proxy
+            else:
+                proxy_url = f"http://{proxy}"
+            return {'http': proxy_url, 'https': proxy_url}
+
+    def _create_auth_extension(self, proxy_host, proxy_port, username, password):
+        """Create a Chrome extension for proxy authentication (HTTP/HTTPS)."""
+        manifest_json = """
+        {
+            "version": "1.0.0",
+            "manifest_version": 2,
+            "name": "Chrome Proxy",
+            "permissions": [
+                "proxy",
+                "tabs",
+                "unlimitedStorage",
+                "storage",
+                "<all_urls>",
+                "webRequest",
+                "webRequestBlocking"
+            ],
+            "background": {
+                "scripts": ["background.js"]
+            }
+        }
+        """
+        background_js = f"""
+        var config = {{
+            mode: "fixed_servers",
+            rules: {{
+                singleProxy: {{
+                    scheme: "http",
+                    host: "{proxy_host}",
+                    port: parseInt({proxy_port})
+                }},
+                bypassList: ["localhost"]
+            }}
+        }};
+        chrome.proxy.settings.set({{value: config, scope: "regular"}}, function() {{}});
+        function callbackFn(details) {{
+            return {{
+                authCredentials: {{
+                    username: "{username}",
+                    password: "{password}"
+                }}
+            }};
+        }}
+        chrome.webRequest.onAuthRequired.addListener(
+            callbackFn,
+            {{urls: ["<all_urls>"]}},
+            ['blocking']
+        );
+        """
+
+        pluginfile = tempfile.NamedTemporaryFile(suffix='.zip', delete=False)
+        with zipfile.ZipFile(pluginfile.name, 'w') as zp:
+            zp.writestr("manifest.json", manifest_json)
+            zp.writestr("background.js", background_js)
+        return pluginfile.name
+
+    def launch_browser_with_proxy(self, proxy_url=None):
+        proxy = proxy_url or self.get_next_proxy()
         print(f"Launching browser with proxy: {proxy}")
+
+        parsed = urlparse(proxy)
+        scheme = parsed.scheme.lower() if parsed.scheme else 'http'
 
         chrome_options = Options()
         chrome_options.add_argument('--no-sandbox')
         chrome_options.add_argument('--disable-dev-shm-usage')
         chrome_options.add_argument('--disable-gpu')
         chrome_options.add_argument('--log-level=3')
-        chrome_options.add_argument(f'--proxy-server={proxy}')
         chrome_options.add_argument('--proxy-bypass-list=<-loopback>')
         chrome_options.add_argument('--ignore-certificate-errors')
         chrome_options.add_argument('--disable-blink-features=BlockCredentialedSubresources')
 
-        chrome_options.binary_location = r"C:\Users\!!USER!!\Desktop\chrome-win64\chrome.exe"
+        if self.chrome_path:
+            chrome_options.binary_location = self.chrome_path
+
+        if scheme in ['http', 'https']:
+            if parsed.username and parsed.password:
+                pluginfile = self._create_auth_extension(parsed.hostname, parsed.port, parsed.username, parsed.password)
+                chrome_options.add_extension(pluginfile)
+            else:
+                chrome_options.add_argument(f'--proxy-server={proxy}')
+        elif scheme in ['socks4', 'socks5']:
+            chrome_options.add_argument(f'--proxy-server={proxy}')
+        else:
+            raise ValueError(f"Unsupported proxy scheme: {scheme}")
 
         return webdriver.Chrome(options=chrome_options)
 
-def run_http_client(pm):
+def run_http_client(pm, logger=print):
     url = 'http://httpbin.org/ip'
     for i in range(5):
-        proxy = pm.get_requests_proxy_dict()
-        print(f"\n[HTTP {i+1}] Using proxy: {pm.current_proxy}")
+        proxy_dict, raw_proxy = pm.get_requests_proxy_dict()
+        logger(f"\n[HTTP {i+1}] Using proxy: {raw_proxy}")
         try:
-            res = requests.get(url, proxies=proxy, timeout=10)
+            res = requests.get(url, proxies=proxy_dict, timeout=10)
             content_type = res.headers.get('Content-Type', '')
             if 'application/json' in content_type:
-                print(f"IP Response: {res.json()}")
+                logger(f"IP Response: {res.json()}")
             else:
-                print(f"[WARNING] Response not JSON. Content-Type: {content_type}")
-                print(f"Response text: {res.text[:200]}")
+                logger(f"[WARNING] Non-JSON response. Content-Type: {content_type}")
+                logger(f"Response body: {res.text[:200]}")
         except Exception as e:
-            print(f"[ERROR] Request failed: {e}")
+            logger(f"[ERROR] Request failed: {e}")
         time.sleep(2)
 
 def run_browser_session(pm):
@@ -121,14 +232,7 @@ def create_default_config():
         'max_valid_proxies': '10',
         'rotate_mode': 'request',
         'test_url': 'https://api.ipify.org?format=json',
-        'browser_binary_path': r"C:\Users\!!USER!!\Desktop\chrome-win64\chrome.exe",
-        'help': (
-            "proxy_file = Path to your proxy list file (one proxy per line, format: IP:PORT)\n"
-            "max_valid_proxies = How many valid proxies to load and use\n"
-            "rotate_mode = 'request' to rotate proxy per HTTP request, 'session' to keep same proxy per session\n"
-            "test_url = URL used to test proxies\n"
-            "browser_binary_path = Path to your Chrome/Chromium executable\n"
-        )
+        'browser_binary_path': r"C:\Users\!!USER!!\Desktop\chrome-win64\chrome.exe"
     }
     with open(CONFIG_FILE, 'w') as configfile:
         config.write(configfile)
@@ -149,13 +253,11 @@ def main():
 
     rotate_mode = settings.get('rotate_mode', 'request').lower()
     rotate_per_request = rotate_mode == 'request'
-
     test_url = settings.get('test_url', 'https://api.ipify.org?format=json')
-
     browser_path = settings.get('browser_binary_path', None)
 
     try:
-        pm = ProxyManager(proxy_file, max_valid, rotate_per_request=rotate_per_request, test_url=test_url)
+        pm = ProxyManager(proxy_file, max_valid, rotate_per_request=rotate_per_request, test_url=test_url, chrome_path=browser_path)
     except RuntimeError as err:
         print(f"[FATAL] {err}")
         return
@@ -169,7 +271,6 @@ def main():
         except ValueError:
             print("Invalid number.")
             return
-
         for i in range(sessions):
             print(f"\n[SESSION {i+1}/{sessions}] Starting browser...")
             run_browser_session(pm)

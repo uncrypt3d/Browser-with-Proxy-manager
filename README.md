@@ -60,7 +60,7 @@ pip install pyqt6 selenium requests
 
 Run the app with:
 
-WITHOUT GUI:
+WITHOUT GUI "TERMINAL MODE":
 ```bash
 python app.py
 ```
@@ -70,7 +70,7 @@ WITH GUI VIA TERMINAL:
 python gui.py
 ```
 
-OR EXE.
+WITHOUT PYTHON use exe from releases or build it yourself.
 
 How to use:
 
@@ -143,7 +143,7 @@ MIT License © 2025 uncrypt3d
 
 ## Contact
 
-For questions or support, email: your.email@example.com
+For questions or support, contact via GitHub 'issues / discussions'.
 
 ---
 
